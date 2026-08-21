@@ -1,0 +1,13 @@
+.{
+    .name = .cddl2c,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0-dev.1606+a06534d73",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "examples",
+    },
+    .fingerprint = 0x9f523b59e90a0f2f,
+}

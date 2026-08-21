@@ -1,0 +1,6 @@
+# Zig build output
+zig-out/
+.zig-cache/
+
+# Generated example artifact (built from examples/sample.cddl by zig build test)
+sample_types.h

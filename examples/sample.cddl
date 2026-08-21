@@ -1,0 +1,79 @@
+; Sample protocol description exercising the constructs cddl2c supports.
+; Compiled and checked by tests/c/generated_types_test.c.
+
+version = 1
+
+; CDDL enumeration -> C enum
+colors = &( red: 0, green: 1, blue: 2 )
+
+; Choice of named int literals -> C enum
+err-ok = 0
+err-crc = 1
+err-timeout = 2
+error-code = err-ok / err-crc / err-timeout
+
+; Scalar aliases -> typedefs
+port = uint .size 2
+sensor-id = uint
+percentage = 0..100
+
+; Array -> struct in field order
+reading = [
+    id: sensor-id,
+    value: float32,
+    level: percentage,
+]
+
+; Map -> struct with optional / repeated members
+config = {
+    name: tstr,
+    color: colors,
+    port: port,
+    ? description: tstr,
+    0*4 extra: uint,
+}
+
+; Heterogeneous choice -> union + choice enum
+event = reading / config / error-code
+
+; Open (extensible) map: the "* any => any" extension point makes decoders
+; skip unknown keys, so future schema versions can add fields without
+; breaking deployed decoders. Maps without it stay strict.
+open-msg = {
+    0 => uint,
+    ? 1 => tstr,
+    * any => any,
+}
+
+; Union of two map types: decoding must recover cleanly when the first
+; alternative enters its map and fails partway through.
+report = config / file-msg
+
+; Large-blob transfer (logs, firmware images, SRECs). Because the last member
+; is a bstr and every member occurs exactly once, cddl2c also generates a
+; fragmented-payload API (cbor_decode_file_msg_frag_begin/next/end and
+; cbor_encode_file_msg_frag_begin/feed/end) so 'data' can be streamed in
+; MTU-sized chunks instead of being held in RAM.
+file-msg = {
+    filename: tstr,
+    file-size: uint,
+    data: bstr,
+}
+
+; CBOR-in-CBOR one-shot: 'inner' is a wrapped CBOR item decoded straight
+; into a typed struct field (struct reading), entering and leaving the
+; byte string transparently.
+envelope = {
+    kind: uint,
+    inner: bstr .cbor reading,
+}
+
+; CBOR-in-CBOR streaming: 'entries' wraps a CBOR sequence of log-entry
+; items. The generated cbor_decode_log_file_frag_item/_frag_at_end (and the
+; encode mirror) stream one entry at a time through MTU-sized payload
+; sections -- the natural shape for shipping structured logs or SREC lines.
+log-entry = [ seq: uint, msg: tstr ]
+log-file = {
+    name: tstr,
+    entries: bstr .cborseq [* log-entry],
+}
