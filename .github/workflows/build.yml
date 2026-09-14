@@ -74,7 +74,9 @@ jobs:
           if-no-files-found: error
 
   release:
-    # Attach the binaries to GitHub releases on version tags.
+    # Tag a version (e.g. git tag v1.0.0 && git push origin v1.0.0) and the
+    # full test+build pipeline runs; on success the binaries are attached to
+    # a GitHub release named after the tag.
     name: release
     runs-on: ubuntu-latest
     needs: build
@@ -82,21 +84,26 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Downloads each artifact into artifacts/<artifact-name>/ (no merge,
+      # so the linux and windows binaries stay distinguishable).
       - uses: actions/download-artifact@v4
         with:
           pattern: cddl2c-*
-          merge-multiple: true
-          path: release
+          path: artifacts
 
-      - name: Package
+      - name: Package release assets
         run: |
-          cd release
-          chmod +x cddl2c cddl2c.exe
-          sha256sum cddl2c cddl2c.exe > SHA256SUMS
+          mkdir -p release
+          cp artifacts/cddl2c-linux-amd64/cddl2c release/cddl2c-linux-amd64
+          cp artifacts/cddl2c-windows-amd64/cddl2c.exe release/cddl2c-windows-amd64.exe
+          chmod +x release/cddl2c-linux-amd64 release/cddl2c-windows-amd64.exe
+          cd release && sha256sum cddl2c-linux-amd64 cddl2c-windows-amd64.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/cddl2c
-            release/cddl2c.exe
-            release/SHA256SUMS
+            release/cddl2c-linux-amd64
+            release/cddl2c-windows-amd64.exe
+            release/SHA256SUMS.txt
+          generate_release_notes: true
