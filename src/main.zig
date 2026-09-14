@@ -26,7 +26,10 @@ pub fn main(init: std.process.Init) !u8 {
     var entry_restrict = false;
     var unordered_maps = true;
 
-    var args = std.process.Args.Iterator.init(init.minimal.args);
+    // initAllocator is required for Windows/WASI targets (the command line
+    // must be decoded from UTF-16 into the arena); on POSIX it is a no-op.
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, arena);
+    defer args.deinit();
     _ = args.next(); // program name
     var pending: ?[:0]const u8 = null;
     while (pending orelse args.next()) |arg| {
