@@ -1,0 +1,39 @@
+name: setup-zig-pinned
+description: >
+  Install the pinned Zig dev build from the pkg.hexops.org mirror with
+  sha256 verification. setup-zig@v2 cannot fetch this pinned dev build
+  (404 on its mirrors), and dev builds rotate off the community mirror.
+inputs:
+  version:
+    description: Zig version (keep in sync with build.zig.zon minimum_zig_version)
+    required: true
+  sha256:
+    description: Expected sha256 of the x86_64-linux tarball
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Cache pinned Zig tarball
+      id: zig-cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/.zig-dist
+        key: zig-x86_64-linux-${{ inputs.version }}
+
+    - name: Download and verify Zig
+      if: steps.zig-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p "${RUNNER_TEMP}/.zig-dist"
+        curl -fL --retry 3 -o "${RUNNER_TEMP}/.zig-dist/zig.tar.xz" \
+          "https://pkg.hexops.org/zig/zig-x86_64-linux-${{ inputs.version }}.tar.xz"
+        echo "${{ inputs.sha256 }}  ${RUNNER_TEMP}/.zig-dist/zig.tar.xz" | sha256sum -c -
+
+    - name: Extract Zig onto PATH
+      shell: bash
+      run: |
+        mkdir -p "${RUNNER_TEMP}/.zig"
+        tar -xJf "${RUNNER_TEMP}/.zig-dist/zig.tar.xz" \
+          -C "${RUNNER_TEMP}/.zig" --strip-components=1
+        "${RUNNER_TEMP}/.zig/zig" version
+        echo "${RUNNER_TEMP}/.zig" >> "$GITHUB_PATH"

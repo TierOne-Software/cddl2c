@@ -8,8 +8,10 @@ on:
   workflow_dispatch:
 
 env:
-  # Must match build.zig.zon minimum_zig_version. Update both together.
+  # Must match build.zig.zon minimum_zig_version. Update all three
+  # together when bumping Zig.
   ZIG_VERSION: "0.17.0-dev.1606+a06534d73"
+  ZIG_SHA256: "25bcb0cf8e31314b798f2b9318e1ccd13ea8bd21f030c734923f263578b8d520"
 
 jobs:
   test:
@@ -18,9 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: goto-bus-stop/setup-zig@v2
+      - uses: ./.github/actions/setup-zig-pinned
         with:
           version: ${{ env.ZIG_VERSION }}
+          sha256: ${{ env.ZIG_SHA256 }}
 
       - name: Run test suite (unit, fragments, fuzz, generated-codec e2e)
         run: zig build test
@@ -43,9 +46,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: goto-bus-stop/setup-zig@v2
+      - uses: ./.github/actions/setup-zig-pinned
         with:
           version: ${{ env.ZIG_VERSION }}
+          sha256: ${{ env.ZIG_SHA256 }}
 
       # Zig cross-compiles the Windows binary from the Linux runner;
       # both outputs are fully static/self-contained.
