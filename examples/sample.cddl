@@ -77,3 +77,13 @@ log-file = {
     name: tstr,
     entries: bstr .cborseq [* log-entry],
 }
+
+; Regression: bounded array whose elements are maps. Decoding a repeated
+; container nests zcbor backup states (one per repeat attempt, one per map
+; key scan) that are live concurrently across nesting levels; the entry
+; states[] budget must cover that peak or every decode fails.
+metric = {
+    id: uint,
+    value: uint,
+}
+metric-list = [ 1*32 metric ]

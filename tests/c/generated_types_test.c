@@ -657,6 +657,65 @@ static int check_open_map_forward_compat(void)
 	return 0;
 }
 
+/* Regression for the entry states[] budget: a bounded array whose elements
+ * are maps decodes with nested concurrent zcbor backups. Before the fix,
+ * cbor_decode_metric_list failed on EVERY input (masked as
+ * ZCBOR_ERR_ITERATIONS; the real error was NO_BACKUP_MEM). */
+static int check_metric_list_roundtrip(void)
+{
+	uint8_t payload[1024];
+	size_t enc_len = 0;
+	size_t dec_len = 0;
+
+	struct metric_list ml;
+	struct metric_list out;
+
+	/* Lower bound: 1 entry. */
+	memset(&ml, 0, sizeof(ml));
+	ml.metric_count = 1;
+	ml.metric[0].id = 7;
+	ml.metric[0].value = 77;
+	if (cbor_encode_metric_list(payload, sizeof(payload), &ml, &enc_len) != ZCBOR_SUCCESS)
+		return 40;
+	memset(&out, 0, sizeof(out));
+	if (cbor_decode_metric_list(payload, enc_len, &out, &dec_len) != ZCBOR_SUCCESS)
+		return 41;
+	if (dec_len != enc_len || out.metric_count != 1 ||
+	    out.metric[0].id != 7 || out.metric[0].value != 77)
+		return 42;
+
+	/* Two entries. */
+	memset(&ml, 0, sizeof(ml));
+	ml.metric_count = 2;
+	ml.metric[0].id = 1;
+	ml.metric[0].value = 100;
+	ml.metric[1].id = 2;
+	ml.metric[1].value = 200;
+	if (cbor_encode_metric_list(payload, sizeof(payload), &ml, &enc_len) != ZCBOR_SUCCESS)
+		return 43;
+	memset(&out, 0, sizeof(out));
+	if (cbor_decode_metric_list(payload, enc_len, &out, &dec_len) != ZCBOR_SUCCESS)
+		return 44;
+	if (out.metric_count != 2 || out.metric[1].id != 2 || out.metric[1].value != 200)
+		return 45;
+
+	/* Upper bound: 32 entries must decode whole. */
+	memset(&ml, 0, sizeof(ml));
+	ml.metric_count = 32;
+	for (size_t i = 0; i < 32; i++) {
+		ml.metric[i].id = (uint32_t)i;
+		ml.metric[i].value = (uint32_t)(i * 10);
+	}
+	if (cbor_encode_metric_list(payload, sizeof(payload), &ml, &enc_len) != ZCBOR_SUCCESS)
+		return 46;
+	memset(&out, 0, sizeof(out));
+	if (cbor_decode_metric_list(payload, enc_len, &out, &dec_len) != ZCBOR_SUCCESS)
+		return 47;
+	if (out.metric_count != 32 || out.metric[31].id != 31 || out.metric[31].value != 310)
+		return 48;
+	return 0;
+}
+
 int main(void)
 {
 	int rc;
@@ -664,6 +723,8 @@ int main(void)
 	if ((rc = check_types()) != 0)
 		return rc;
 	if ((rc = check_config_roundtrip()) != 0)
+		return rc;
+	if ((rc = check_metric_list_roundtrip()) != 0)
 		return rc;
 	if ((rc = check_event_roundtrip()) != 0)
 		return rc;

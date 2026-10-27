@@ -2516,7 +2516,16 @@ const Gen = struct {
             .validator => |n| .{ .stem = n.stem, .ctext = null, .depth = n.depth },
             .constant, .none => return,
         };
-        const n_states = info.depth + 2;
+        // zcbor decodes hold CONCURRENT backup states across nesting levels:
+        // one per container start, one per repeat-element attempt
+        // (zcbor_multi_decode_w_backup), and one per unordered-map key scan.
+        // That is up to two live backups per nesting level, plus the root
+        // state and a transient one for union/optional backtracking -- so a
+        // [ N*M container ] type at depth 2 needs 5+ states while
+        // depth + 2 provided only 4, and every decode failed (masked as
+        // ZCBOR_ERR_ITERATIONS; the real error was NO_BACKUP_MEM).
+        // Budget 2 per level + root + margin.
+        const n_states = info.depth * 2 + 3;
 
         // zcbor_entry_function takes a zcbor_decoder_t; encoders have a
         // const parameter, so give each entry a decoder-typed shim instead
