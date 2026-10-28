@@ -87,3 +87,11 @@ metric = {
     value: uint,
 }
 metric-list = [ 1*32 metric ]
+
+; Group composition (RFC 8610): a bare group reference inside a map or
+; array body splices the group's entries in place -- 'counter-msg' and
+; 'counter-pair' generate exactly the code their fully inlined spellings
+; ('{ 0 => uint, 1 => uint }' / '[ 0 => uint, 1 => uint ]') would.
+counters = ( 0 => uint, 1 => uint )
+counter-msg = { counters }
+counter-pair = [ counters ]

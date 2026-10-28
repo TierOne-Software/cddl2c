@@ -716,6 +716,45 @@ static int check_metric_list_roundtrip(void)
 	return 0;
 }
 
+/* Group composition (RFC 8610): 'counters' is a group rule referenced from
+ * a map body and an array body; the generated code is identical to the
+ * fully inlined spelling, so it must round-trip at runtime like one. */
+static int check_group_ref_roundtrip(void)
+{
+	uint8_t payload[64];
+	size_t enc_len = 0;
+	size_t dec_len = 0;
+
+	struct counter_msg cm;
+	memset(&cm, 0, sizeof(cm));
+	cm.k0 = 7;
+	cm.k1 = 42;
+	if (cbor_encode_counter_msg(payload, sizeof(payload), &cm, &enc_len) != ZCBOR_SUCCESS)
+		return 150;
+	if (enc_len == 0)
+		return 151;
+	struct counter_msg out;
+	memset(&out, 0, sizeof(out));
+	if (cbor_decode_counter_msg(payload, enc_len, &out, &dec_len) != ZCBOR_SUCCESS)
+		return 152;
+	if (dec_len != enc_len || out.k0 != 7 || out.k1 != 42)
+		return 153;
+
+	struct counter_pair cp;
+	memset(&cp, 0, sizeof(cp));
+	cp.k0 = 3;
+	cp.k1 = 4;
+	if (cbor_encode_counter_pair(payload, sizeof(payload), &cp, &enc_len) != ZCBOR_SUCCESS)
+		return 154;
+	struct counter_pair pout;
+	memset(&pout, 0, sizeof(pout));
+	if (cbor_decode_counter_pair(payload, enc_len, &pout, &dec_len) != ZCBOR_SUCCESS)
+		return 155;
+	if (dec_len != enc_len || pout.k0 != 3 || pout.k1 != 4)
+		return 156;
+	return 0;
+}
+
 int main(void)
 {
 	int rc;
@@ -743,6 +782,8 @@ int main(void)
 	if ((rc = check_union_rollback_and_trailing()) != 0)
 		return rc;
 	if ((rc = check_open_map_forward_compat()) != 0)
+		return rc;
+	if ((rc = check_group_ref_roundtrip()) != 0)
 		return rc;
 	return 0;
 }

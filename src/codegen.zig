@@ -101,9 +101,13 @@ pub fn generateAll(
     opts: Options,
     diag: *Diagnostic,
 ) Error!Output {
+    // RFC 8610 group composition: splice group references into their entry
+    // lists before anything else looks at the document. Already-flattened
+    // documents pass through unchanged.
+    const flat = try flattenGroupRefs(gpa, &doc, diag);
     var gen = Gen{
         .gpa = gpa,
-        .doc = &doc,
+        .doc = &flat,
         .opts = opts,
         .diag = diag,
         .xc = opts.xcode.decode or opts.xcode.encode,
@@ -114,7 +118,15 @@ pub fn generateAll(
             _ = try gen.resolveRule(name);
         }
     } else {
-        for (doc.rules) |rule| {
+        for (flat.rules) |rule| {
+            // RFC 8610: a group rule is a composition template, not a type.
+            // It generates no struct, enum, or codec of its own; its entries
+            // appear only where the group is referenced (spliced in).
+            // Enum '&group' handling resolves groups on its own, unaffected.
+            switch (rule.value) {
+                .group => continue,
+                else => {},
+            }
             _ = try gen.resolveRule(rule.name);
         }
     }
@@ -130,6 +142,183 @@ pub fn generateAll(
     }
     return out;
 }
+
+// --- Group-reference flattening (RFC 8610 group composition) -----------------
+//
+// A group entry that is a bare reference to a group rule
+// (`drain-valve = { vat-counter }`) is not a member of its own: the
+// referenced group's entries are spliced in its place, so the referencing
+// rule generates exactly the same code as its fully spelled-out equivalent.
+// The splice happens on the AST before any member codegen, so everything
+// downstream (struct layout, xcode, states[] budgets, union-disjointness
+// validation) operates on plain entry lists and needs no changes.
+//
+// V1 restrictions, each a clear error instead of a silent surprise:
+//   - a group reference must occur exactly once (no `? g`, `* g`, `1*2 g`),
+//   - the referenced group must have exactly one choice (no `//` groups),
+//   - references must not cycle (directly or transitively).
+// Nested references (a referenced group that itself references groups)
+// splice recursively; forward references work because lookup is
+// order-independent. A bare name that resolves to a type rule, or appears
+// with a member key, keeps its existing type-member meaning.
+
+pub fn flattenGroupRefs(gpa: std.mem.Allocator, doc: *const ast.Document, diag: *Diagnostic) Error!ast.Document {
+    var f = Flattener{ .gpa = gpa, .doc = doc, .diag = diag };
+    return f.flattenDocument();
+}
+
+const Flattener = struct {
+    gpa: std.mem.Allocator,
+    doc: *const ast.Document,
+    diag: *Diagnostic,
+    /// Group rules currently being spliced, for cycle detection.
+    stack: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Cap on spliced entries: nested groups that reference each other in a
+    /// diamond pattern would otherwise expand exponentially.
+    spliced_entries: usize = 0,
+
+    const max_spliced_entries = 100_000;
+
+    fn err(self: *Flattener, e: Error, message: []const u8, context: []const u8) Error {
+        self.diag.* = .{ .message = message, .context = context };
+        return e;
+    }
+
+    fn flattenDocument(self: *Flattener) Error!ast.Document {
+        const rules = try self.gpa.alloc(ast.Rule, self.doc.rules.len);
+        for (self.doc.rules, 0..) |rule, i| {
+            rules[i] = .{
+                .name = rule.name,
+                .value = switch (rule.value) {
+                    .group => |g| .{ .group = try self.flattenGroup(g) },
+                    .type => |t| .{ .type = try self.flattenType(t) },
+                },
+            };
+        }
+        return .{ .rules = rules };
+    }
+
+    fn flattenGroup(self: *Flattener, group: ast.Group) Error!ast.Group {
+        const choices = try self.gpa.alloc(ast.GroupChoice, group.choices.len);
+        for (group.choices, 0..) |choice, ci| {
+            var entries: std.ArrayListUnmanaged(ast.Entry) = .empty;
+            for (choice.entries) |entry| try self.flattenEntry(&entries, entry);
+            choices[ci] = .{ .entries = try entries.toOwnedSlice(self.gpa) };
+        }
+        return .{ .choices = choices };
+    }
+
+    fn flattenEntry(self: *Flattener, out: *std.ArrayListUnmanaged(ast.Entry), entry: ast.Entry) Error!void {
+        const key = try self.flattenKey(entry.key);
+        switch (entry.value) {
+            .inline_group => |g| {
+                const ptr = try self.gpa.create(ast.Group);
+                ptr.* = try self.flattenGroup(g.*);
+                try out.append(self.gpa, .{ .occur = entry.occur, .key = key, .value = .{ .inline_group = ptr } });
+            },
+            .type => |t| {
+                // Bare group reference: splice the target group's entries.
+                if (key == null) {
+                    if (t.single()) |t1| {
+                        if (t1.op == null) {
+                            switch (t1.base) {
+                                .typename => |name| {
+                                    if (self.doc.find(name)) |target| {
+                                        switch (target.value) {
+                                            .group => |g| return self.splice(out, entry, name, g),
+                                            .type => {},
+                                        }
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
+                try out.append(self.gpa, .{ .occur = entry.occur, .key = key, .value = .{ .type = try self.flattenType(t) } });
+            },
+        }
+    }
+
+    fn splice(self: *Flattener, out: *std.ArrayListUnmanaged(ast.Entry), entry: ast.Entry, name: []const u8, group: ast.Group) Error!void {
+        if (!entry.occur.isOne()) {
+            return self.err(error.Unsupported, "occurrences on group references are not supported", name);
+        }
+        if (group.choices.len != 1) {
+            return self.err(error.Unsupported, "multi-choice group references are not supported", name);
+        }
+        for (self.stack.items) |on_stack| {
+            if (std.mem.eql(u8, on_stack, name)) {
+                return self.err(error.RecursiveType, "recursive group reference", name);
+            }
+        }
+        if (self.stack.items.len > 200) {
+            return self.err(error.RecursiveType, "group reference chain too deep", name);
+        }
+        try self.stack.append(self.gpa, name);
+        defer _ = self.stack.pop();
+        const flat = try self.flattenGroup(group);
+        for (flat.choices[0].entries) |sub| {
+            self.spliced_entries += 1;
+            if (self.spliced_entries > max_spliced_entries) {
+                return self.err(error.Unsupported, "group reference expansion too large", name);
+            }
+            try out.append(self.gpa, sub);
+        }
+    }
+
+    fn flattenKey(self: *Flattener, key: ?ast.Key) Error!?ast.Key {
+        const k = key orelse return null;
+        switch (k) {
+            .bareword, .value => return k,
+            .type => |t1| {
+                const ptr = try self.gpa.create(ast.Type1);
+                ptr.* = try self.flattenType1(t1.*);
+                return .{ .type = ptr };
+            },
+        }
+    }
+
+    fn flattenType(self: *Flattener, t: ast.Type) Error!ast.Type {
+        const choices = try self.gpa.alloc(ast.Type1, t.choices.len);
+        for (t.choices, 0..) |c, i| choices[i] = try self.flattenType1(c);
+        return .{ .choices = choices };
+    }
+
+    fn flattenType1(self: *Flattener, t1: ast.Type1) Error!ast.Type1 {
+        var out = t1;
+        out.base = try self.flattenType2(t1.base);
+        if (t1.op) |op| {
+            const rhs = try self.gpa.create(ast.Type2);
+            rhs.* = try self.flattenType2(op.rhs.*);
+            out.op = .{ .kind = op.kind, .ctl = op.ctl, .rhs = rhs };
+        }
+        return out;
+    }
+
+    fn flattenType2(self: *Flattener, t2: ast.Type2) Error!ast.Type2 {
+        switch (t2) {
+            .map => |g| return .{ .map = try self.flattenGroup(g) },
+            .array => |g| return .{ .array = try self.flattenGroup(g) },
+            .enum_inline => |g| {
+                const ptr = try self.gpa.create(ast.Group);
+                ptr.* = try self.flattenGroup(g.*);
+                return .{ .enum_inline = ptr };
+            },
+            .paren => |inner| {
+                const ptr = try self.gpa.create(ast.Type);
+                ptr.* = try self.flattenType(inner.*);
+                return .{ .paren = ptr };
+            },
+            .tagged => |tg| {
+                const ptr = try self.gpa.create(ast.Type);
+                ptr.* = try self.flattenType(tg.inner.*);
+                return .{ .tagged = .{ .tag = tg.tag, .inner = ptr } };
+            },
+            else => return t2,
+        }
+    }
+};
 
 fn appendFmt(
     list: *std.ArrayList(u8),
@@ -2841,6 +3030,16 @@ fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     }
 }
 
+/// Generation must fail with `expected` and a diagnostic mentioning
+/// `msg_substr`.
+fn expectGenError(arena: std.mem.Allocator, source: []const u8, expected: anyerror, msg_substr: []const u8) !void {
+    var pdiag: Parser.Diagnostic = .{};
+    const doc = try Parser.parse(arena, source, &pdiag);
+    var gdiag: Diagnostic = .{};
+    try testing.expectError(expected, generateDiag(arena, doc, .{}, &gdiag));
+    try expectContains(gdiag.message, msg_substr);
+}
+
 test "CDDL enum (&group) maps to C enum" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -3072,6 +3271,181 @@ test "group choices inside a map become a union" {
     );
     try expectContains(out, "enum msg_choice");
     try expectContains(out, "struct msg_variant");
+}
+
+// --- RFC 8610 group composition: group references inside map/array bodies ---
+
+test "group reference in a map splices the group's entries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The group-referenced spelling must generate byte-identical output to
+    // the fully inlined map.
+    const a = try generateXcodeTest(arena.allocator(),
+        \\vat-counter = ( 0 => uint, 1 => uint )
+        \\drain-valve = { vat-counter }
+    );
+    const b = try generateXcodeTest(arena.allocator(),
+        \\vat-counter = ( 0 => uint, 1 => uint )
+        \\drain-valve = { 0 => uint, 1 => uint }
+    );
+    try testing.expectEqualStrings(b.types_h, a.types_h);
+    try testing.expectEqualStrings(b.decode_h.?, a.decode_h.?);
+    try testing.expectEqualStrings(b.decode_c.?, a.decode_c.?);
+    try testing.expectEqualStrings(b.encode_h.?, a.encode_h.?);
+    try testing.expectEqualStrings(b.encode_c.?, a.encode_c.?);
+    try expectContains(a.types_h,
+        \\struct drain_valve {
+        \\    uint32_t k0;
+        \\    uint32_t k1;
+        \\};
+    );
+}
+
+test "group rules emit no standalone struct or codec" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // RFC 8610: a group rule is a composition template, not a type. Its
+    // entries appear only where the group is referenced (spliced into the
+    // referencing item), so the group itself must not generate a struct or
+    // encode/decode functions of its own.
+    const out = try generateXcodeTest(arena.allocator(),
+        \\vat-counter = ( 0 => uint, 1 => uint )
+        \\drain-valve = { vat-counter }
+    );
+    try expectContains(out.types_h,
+        \\struct drain_valve {
+    );
+    try testing.expect(std.mem.indexOf(u8, out.types_h, "vat_counter") == null);
+    try testing.expect(std.mem.indexOf(u8, out.encode_c.?, "vat_counter") == null);
+    try testing.expect(std.mem.indexOf(u8, out.decode_c.?, "vat_counter") == null);
+}
+
+test "group reference in an array body splices the group's entries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = try generateXcodeTest(arena.allocator(),
+        \\pair-group = ( 0 => uint, 1 => tstr )
+        \\pair = [ pair-group ]
+    );
+    const b = try generateXcodeTest(arena.allocator(),
+        \\pair-group = ( 0 => uint, 1 => tstr )
+        \\pair = [ 0 => uint, 1 => tstr ]
+    );
+    try testing.expectEqualStrings(b.types_h, a.types_h);
+    try testing.expectEqualStrings(b.decode_c.?, a.decode_c.?);
+    try testing.expectEqualStrings(b.encode_c.?, a.encode_c.?);
+    try expectContains(a.types_h,
+        \\struct pair {
+        \\    uint32_t k0;
+        \\    struct zcbor_string k1;
+        \\};
+    );
+}
+
+test "nested group references splice recursively" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // 'outer' references 'inner' inside a group rule body; both are spliced
+    // when 'item' references 'outer'.
+    const a = try generateXcodeTest(arena.allocator(),
+        \\inner = ( 0 => uint )
+        \\outer = ( inner, 3 => tstr )
+        \\item = { outer }
+    );
+    const b = try generateXcodeTest(arena.allocator(),
+        \\inner = ( 0 => uint )
+        \\outer = ( inner, 3 => tstr )
+        \\item = { 0 => uint, 3 => tstr }
+    );
+    try testing.expectEqualStrings(b.types_h, a.types_h);
+    try testing.expectEqualStrings(b.decode_c.?, a.decode_c.?);
+    try testing.expectEqualStrings(b.encode_c.?, a.encode_c.?);
+    try expectContains(a.types_h,
+        \\struct item {
+        \\    uint32_t k0;
+        \\    struct zcbor_string k3;
+        \\};
+    );
+}
+
+test "forward-referenced group definitions splice" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // 'item' references 'g' before it is defined.
+    const a = try generateXcodeTest(arena.allocator(),
+        \\item = { g }
+        \\g = ( 0 => uint, 1 => tstr )
+    );
+    const b = try generateXcodeTest(arena.allocator(),
+        \\item = { 0 => uint, 1 => tstr }
+        \\g = ( 0 => uint, 1 => tstr )
+    );
+    try testing.expectEqualStrings(b.types_h, a.types_h);
+    try testing.expectEqualStrings(b.decode_c.?, a.decode_c.?);
+    try testing.expectEqualStrings(b.encode_c.?, a.encode_c.?);
+}
+
+test "spliced groups keep optional members and extension points" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Optional members and the "* any => any" extension point inside the
+    // referenced group behave exactly as if written inline.
+    const a = try generateXcodeTest(arena.allocator(),
+        \\extra = ( ? 2 => tstr, * any => any )
+        \\item = { 0 => uint, extra }
+    );
+    const b = try generateXcodeTest(arena.allocator(),
+        \\extra = ( ? 2 => tstr, * any => any )
+        \\item = { 0 => uint, ? 2 => tstr, * any => any }
+    );
+    try testing.expectEqualStrings(b.types_h, a.types_h);
+    try testing.expectEqualStrings(b.decode_c.?, a.decode_c.?);
+    try testing.expectEqualStrings(b.encode_c.?, a.encode_c.?);
+    try expectContains(a.types_h, "bool k2_present;");
+    try expectContains(a.decode_c.?, "skip_unknown");
+}
+
+test "occurrences on group references are rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try expectGenError(arena.allocator(),
+        \\g = ( 0 => uint )
+        \\item = [ ? g ]
+    , error.Unsupported, "occurrence");
+    try expectGenError(arena.allocator(),
+        \\g = ( 0 => uint )
+        \\item = [ 1*2 g ]
+    , error.Unsupported, "occurrence");
+    try expectGenError(arena.allocator(),
+        \\g = ( 0 => uint )
+        \\item = { ? g }
+    , error.Unsupported, "occurrence");
+}
+
+test "multi-choice group references are rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try expectGenError(arena.allocator(),
+        \\g = ( 0 => uint // 1 => tstr )
+        \\item = [ g ]
+    , error.Unsupported, "multi-choice");
+    try expectGenError(arena.allocator(),
+        \\g = ( 0 => uint // 1 => tstr )
+        \\item = { g }
+    , error.Unsupported, "multi-choice");
+}
+
+test "cyclic group references are rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try expectGenError(arena.allocator(),
+        \\a = ( b )
+        \\b = ( a )
+        \\item = { a }
+    , error.RecursiveType, "recursive group reference");
+    try expectGenError(arena.allocator(),
+        \\loop = ( loop )
+    , error.RecursiveType, "recursive group reference");
 }
 
 test "recursive types are rejected" {

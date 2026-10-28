@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     var pdiag: cddl.Parser.Diagnostic = .{};
-    const doc = cddl.Parser.parse(arena, source, &pdiag) catch |err| switch (err) {
+    const parsed = cddl.Parser.parse(arena, source, &pdiag) catch |err| switch (err) {
         error.ParseError => {
             std.debug.print("{s}:{d}:{d}: error: {s}\n", .{
                 in_path, pdiag.line, pdiag.column, pdiag.message,
@@ -109,6 +109,20 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         },
         else => return err,
+    };
+
+    // RFC 8610 group composition: splice group references into their entry
+    // lists up front, so union validation and codegen both see the same flat
+    // entries as the fully spelled-out equivalent.
+    var fdiag: cddl.codegen.Diagnostic = .{};
+    const doc = cddl.codegen.flattenGroupRefs(arena, &parsed, &fdiag) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            std.debug.print("{s}: error: {s}: {s} ({t})\n", .{
+                in_path, fdiag.message, fdiag.context, err,
+            });
+            return 1;
+        },
     };
 
     // Reject ambiguous unions before generating anything: the decoder picks
