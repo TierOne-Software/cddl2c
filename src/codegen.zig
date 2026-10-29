@@ -209,10 +209,11 @@ const Flattener = struct {
             var entries: std.ArrayListUnmanaged(ast.Entry) = .empty;
             const before = self.spliced_entries;
             for (choice.entries) |entry| try self.flattenEntry(&entries, entry);
-            // A splice can bring in a key the host already has; that would
-            // generate two C members with one name. Reported here, because
-            // after flattening nobody can tell where an entry came from.
-            if (self.spliced_entries != before) try self.checkDuplicateKeys(entries.items);
+            // Two entries with one key would generate two C members with one
+            // name, whether hand-written or brought in by a splice. Checked
+            // here, because after flattening nobody can tell where an entry
+            // came from.
+            try self.checkDuplicateKeys(entries.items, self.spliced_entries != before);
             choices[ci] = .{ .entries = try entries.toOwnedSlice(self.gpa) };
         }
         return .{ .choices = choices };
@@ -281,7 +282,7 @@ const Flattener = struct {
         }
     }
 
-    fn checkDuplicateKeys(self: *Flattener, entries: []const ast.Entry) Error!void {
+    fn checkDuplicateKeys(self: *Flattener, entries: []const ast.Entry, spliced: bool) Error!void {
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(self.gpa);
         for (entries) |entry| {
@@ -304,7 +305,8 @@ const Flattener = struct {
             };
             const gop = try seen.getOrPut(self.gpa, id);
             if (gop.found_existing) {
-                return self.err(error.Unsupported, "duplicate member key after group reference expansion", shown);
+                const msg = if (spliced) "duplicate member key after group reference expansion" else "duplicate member key";
+                return self.err(error.Unsupported, msg, shown);
             }
         }
     }
@@ -3534,6 +3536,24 @@ test "duplicate keys brought in by a splice are rejected" {
     try testing.expectEqualStrings("7", gdiag.context);
 }
 
+test "hand-written duplicate keys and empty-group refs do not hide them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try expectGenError(a,
+        \\m = { 0 => uint, 0 => tstr }
+    , error.Unsupported, "duplicate member key");
+    try expectGenError(a,
+        \\e = ( )
+        \\m = { 0 => uint, 0 => tstr, e }
+    , error.Unsupported, "duplicate member key");
+        // different choices of one group may reuse a key (types-only)
+    var pdiag: Parser.Diagnostic = .{};
+    const doc = try Parser.parse(a, "m = { ( 0 => uint // 0 => tstr ) }\n", &pdiag);
+    var gdiag: Diagnostic = .{};
+    _ = try generateDiag(a, doc, .{}, &gdiag);
+}
+
 test "distinct keys across spliced groups are not flagged" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -3571,11 +3591,14 @@ test "a diamond of non-empty groups hits the expansion cap" {
         try appendFmt(&src, arena.allocator(), "g{d} = ( g{d}, g{d} )\n", .{ i, i - 1, i - 1 });
     }
     try src.appendSlice(arena.allocator(), "m = { g39 }\n");
-    // Fails either as "too large" or as a duplicate key, but must fail fast.
+    // g39 repeats key 0 2^39 times: the duplicate key (found while expanding
+    // a small level) or the size cap fires first; either way it fails fast.
     var pdiag: Parser.Diagnostic = .{};
     const doc = try Parser.parse(arena.allocator(), src.items, &pdiag);
     var gdiag: Diagnostic = .{};
     try testing.expectError(error.Unsupported, generateDiag(arena.allocator(), doc, .{}, &gdiag));
+    try testing.expect(std.mem.indexOf(u8, gdiag.message, "duplicate member key") != null or
+        std.mem.indexOf(u8, gdiag.message, "too large") != null);
 }
 
 test "a group rule used as a member value type is rejected" {

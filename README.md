@@ -224,8 +224,9 @@ counter-msg = { counters }           ; same code as { 0 => uint, 1 => uint }
   * `occurrences on group references are not supported` (`? g`, `* g`, `1*2 g`)
   * `multi-choice group references are not supported` (`g = ( a // b )`)
   * `recursive group reference` (a group that refers to itself, directly or not)
-  * `duplicate member key after group reference expansion` (two spliced
-    entries use the same key; bareword `name:` and `"name" =>` are the same key)
+  * `duplicate member key` / `duplicate member key after group reference
+    expansion` (two entries in one map or array use the same key, written
+    by hand or spliced in; bareword `name:` and `"name" =>` are the same key)
   * `group rule cannot be used as a type or entry` (`m = { 5 => g }`, or
     `--entry g`)
   * `group reference expansion too large` (more than 100000 spliced entries)
