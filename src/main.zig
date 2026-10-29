@@ -96,7 +96,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const cwd = std.Io.Dir.cwd();
     const source = cwd.readFileAlloc(io, in_path, arena, .limited(16 * 1024 * 1024)) catch |err| {
-        std.debug.print("error: cannot read {s}: {t}\n", .{ in_path, err });
+        std.debug.print("{s}: error: cannot read file: {t}\n", .{ in_path, err });
         return 1;
     };
 
@@ -118,9 +118,7 @@ pub fn main(init: std.process.Init) !u8 {
     const doc = cddl.codegen.flattenGroupRefs(arena, &parsed, &fdiag) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            std.debug.print("{s}: error: {s}: {s} ({t})\n", .{
-                in_path, fdiag.message, fdiag.context, err,
-            });
+            reportError(in_path, fdiag.message, fdiag.context);
             return 1;
         },
     };
@@ -131,7 +129,7 @@ pub fn main(init: std.process.Init) !u8 {
     cddl.validate.checkAmbiguousUnions(arena, &doc, &vdiag) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.AmbiguousUnion => {
-            std.debug.print("{s}: error: {s}: {s}\n", .{ in_path, vdiag.message, vdiag.context });
+            reportError(in_path, vdiag.message, vdiag.context);
             return 1;
         },
     };
@@ -154,9 +152,7 @@ pub fn main(init: std.process.Init) !u8 {
     }, &gdiag) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            std.debug.print("{s}: error: {s}: {s} ({t})\n", .{
-                in_path, gdiag.message, gdiag.context, err,
-            });
+            reportError(in_path, gdiag.message, gdiag.context);
             return 1;
         },
     };
@@ -171,6 +167,18 @@ pub fn main(init: std.process.Init) !u8 {
         try writeOut(io, encode_c_path, out.encode_c.?);
     }
     return 0;
+}
+
+/// One format for every post-parse error: "FILE: error: MESSAGE: CONTEXT"
+/// (CONTEXT, usually a rule or key name, is omitted when empty). Parse
+/// errors keep their own "FILE:LINE:COL: error: MESSAGE" form because the
+/// parser is the only stage that knows source positions.
+fn reportError(in_path: []const u8, message: []const u8, context: []const u8) void {
+    if (context.len == 0) {
+        std.debug.print("{s}: error: {s}\n", .{ in_path, message });
+    } else {
+        std.debug.print("{s}: error: {s}: {s}\n", .{ in_path, message, context });
+    }
 }
 
 fn writeOut(io: std.Io, path: ?[]const u8, data: []const u8) !void {

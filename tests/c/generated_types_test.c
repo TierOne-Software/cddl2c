@@ -755,6 +755,53 @@ static int check_group_ref_roundtrip(void)
 	return 0;
 }
 
+/* Nested group refs + optional member + extension point. */
+static int check_group_nested_roundtrip(void)
+{
+	uint8_t payload[64];
+	size_t enc_len = 0;
+	size_t dec_len = 0;
+
+	struct rich_msg in;
+	memset(&in, 0, sizeof(in));
+	in.k0 = 1;
+	in.k1 = 2;
+	if (cbor_encode_rich_msg(payload, sizeof(payload), &in, &enc_len) != ZCBOR_SUCCESS)
+		return 160;
+	struct rich_msg out;
+	memset(&out, 1, sizeof(out));
+	if (cbor_decode_rich_msg(payload, enc_len, &out, &dec_len) != ZCBOR_SUCCESS)
+		return 161;
+	if (dec_len != enc_len || out.k0 != 1 || out.k1 != 2 || out.k2_present)
+		return 162;
+
+	/* with the optional member */
+	in.k2_present = true;
+	in.k2.value = (const uint8_t *)"hi";
+	in.k2.len = 2;
+	if (cbor_encode_rich_msg(payload, sizeof(payload), &in, &enc_len) != ZCBOR_SUCCESS)
+		return 163;
+	memset(&out, 0, sizeof(out));
+	if (cbor_decode_rich_msg(payload, enc_len, &out, &dec_len) != ZCBOR_SUCCESS)
+		return 164;
+	if (!out.k2_present || out.k2.len != 2 || memcmp(out.k2.value, "hi", 2) != 0)
+		return 165;
+
+	/* unknown key 7 => 5 is skipped by the extension point */
+	static const uint8_t extra[] = { 0xA3, 0x00, 0x01, 0x01, 0x02, 0x07, 0x05 };
+	memset(&out, 0, sizeof(out));
+	if (cbor_decode_rich_msg(extra, sizeof(extra), &out, &dec_len) != ZCBOR_SUCCESS)
+		return 166;
+	if (out.k0 != 1 || out.k1 != 2 || out.k2_present)
+		return 167;
+
+	/* a wrong type for a spliced key must be rejected */
+	static const uint8_t bad[] = { 0xA2, 0x00, 0x61, 0x61, 0x01, 0x02 };
+	if (cbor_decode_rich_msg(bad, sizeof(bad), &out, &dec_len) == ZCBOR_SUCCESS)
+		return 168;
+	return 0;
+}
+
 int main(void)
 {
 	int rc;
@@ -784,6 +831,8 @@ int main(void)
 	if ((rc = check_open_map_forward_compat()) != 0)
 		return rc;
 	if ((rc = check_group_ref_roundtrip()) != 0)
+		return rc;
+	if ((rc = check_group_nested_roundtrip()) != 0)
 		return rc;
 	return 0;
 }

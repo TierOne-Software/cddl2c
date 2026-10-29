@@ -176,6 +176,11 @@ const Flattener = struct {
     /// Cap on spliced entries: nested groups that reference each other in a
     /// diamond pattern would otherwise expand exponentially.
     spliced_entries: usize = 0,
+    /// Fully flattened single-choice groups, by rule name. Without it a
+    /// chain of groups that each reference the previous one twice is
+    /// re-flattened 2^n times (even when the groups are empty and the
+    /// entry cap never fires).
+    memo: std.StringHashMapUnmanaged(ast.Group) = .empty,
 
     const max_spliced_entries = 100_000;
 
@@ -202,7 +207,12 @@ const Flattener = struct {
         const choices = try self.gpa.alloc(ast.GroupChoice, group.choices.len);
         for (group.choices, 0..) |choice, ci| {
             var entries: std.ArrayListUnmanaged(ast.Entry) = .empty;
+            const before = self.spliced_entries;
             for (choice.entries) |entry| try self.flattenEntry(&entries, entry);
+            // A splice can bring in a key the host already has; that would
+            // generate two C members with one name. Reported here, because
+            // after flattening nobody can tell where an entry came from.
+            if (self.spliced_entries != before) try self.checkDuplicateKeys(entries.items);
             choices[ci] = .{ .entries = try entries.toOwnedSlice(self.gpa) };
         }
         return .{ .choices = choices };
@@ -257,13 +267,45 @@ const Flattener = struct {
         }
         try self.stack.append(self.gpa, name);
         defer _ = self.stack.pop();
-        const flat = try self.flattenGroup(group);
+        const flat = if (self.memo.get(name)) |m| m else blk: {
+            const f = try self.flattenGroup(group);
+            try self.memo.put(self.gpa, name, f);
+            break :blk f;
+        };
         for (flat.choices[0].entries) |sub| {
             self.spliced_entries += 1;
             if (self.spliced_entries > max_spliced_entries) {
                 return self.err(error.Unsupported, "group reference expansion too large", name);
             }
             try out.append(self.gpa, sub);
+        }
+    }
+
+    fn checkDuplicateKeys(self: *Flattener, entries: []const ast.Entry) Error!void {
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(self.gpa);
+        for (entries) |entry| {
+            const key = entry.key orelse continue;
+            const id: []const u8, const shown: []const u8 = switch (key) {
+                .bareword => |w| .{ try std.fmt.allocPrint(self.gpa, "s:{s}", .{w}), w },
+                .value => |v| switch (v) {
+                    .tstr => |t| .{ try std.fmt.allocPrint(self.gpa, "s:{s}", .{t}), t },
+                    .uint => |u| blk: {
+                        const t = try std.fmt.allocPrint(self.gpa, "{d}", .{u});
+                        break :blk .{ try std.fmt.allocPrint(self.gpa, "i:{s}", .{t}), t };
+                    },
+                    .nint => |n| blk: {
+                        const t = try std.fmt.allocPrint(self.gpa, "{d}", .{n});
+                        break :blk .{ try std.fmt.allocPrint(self.gpa, "i:{s}", .{t}), t };
+                    },
+                    else => continue,
+                },
+                .type => continue,
+            };
+            const gop = try seen.getOrPut(self.gpa, id);
+            if (gop.found_existing) {
+                return self.err(error.Unsupported, "duplicate member key after group reference expansion", shown);
+            }
         }
     }
 
@@ -633,7 +675,7 @@ const Gen = struct {
         defer _ = self.in_progress.swapRemove(name);
 
         const result = switch (rule.value) {
-            .group => |group| try self.emitStruct(try sanitize(self.gpa, name), group, .group, false),
+            .group => return self.err(error.Unsupported, "group rule cannot be used as a type or entry; reference it as a bare member inside a map or array body", name),
             .type => |t| try self.resolveTypeRule(name, t),
         };
         try self.resolved.put(self.gpa, name, result);
@@ -3446,6 +3488,179 @@ test "cyclic group references are rejected" {
     try expectGenError(arena.allocator(),
         \\loop = ( loop )
     , error.RecursiveType, "recursive group reference");
+}
+
+test "duplicate keys brought in by a splice are rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // map: two groups with the same uint key
+    try expectGenError(a,
+        \\g = ( 0 => uint )
+        \\h = ( 0 => tstr )
+        \\m = { g, h }
+    , error.Unsupported, "duplicate member key");
+    // host entry vs spliced entry
+    try expectGenError(a,
+        \\g = ( 1 => uint )
+        \\m = { 1 => tstr, g }
+    , error.Unsupported, "duplicate member key");
+    // bareword and text-string spellings are the same key
+    try expectGenError(a,
+        \\g = ( name: uint )
+        \\m = { "name" => tstr, g }
+    , error.Unsupported, "duplicate member key");
+    // negative keys
+    try expectGenError(a,
+        \\g = ( -1 => uint )
+        \\m = { g, -1 => tstr }
+    , error.Unsupported, "duplicate member key");
+    // collision introduced by nesting
+    try expectGenError(a,
+        \\inner = ( 5 => uint )
+        \\outer = ( inner, 5 => tstr )
+        \\m = { outer }
+    , error.Unsupported, "duplicate member key");
+    // arrays too
+    try expectGenError(a,
+        \\g = ( 0 => uint )
+        \\m = [ g, g ]
+    , error.Unsupported, "duplicate member key");
+    // the message names the key
+    var pdiag: Parser.Diagnostic = .{};
+    const doc = try Parser.parse(a, "g = ( 7 => uint )\nm = { g, g }\n", &pdiag);
+    var gdiag: Diagnostic = .{};
+    try testing.expectError(error.Unsupported, generateDiag(a, doc, .{}, &gdiag));
+    try testing.expectEqualStrings("7", gdiag.context);
+}
+
+test "distinct keys across spliced groups are not flagged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try generateXcodeTest(arena.allocator(),
+        \\g = ( 0 => uint )
+        \\h = ( 1 => tstr, "name" => uint, -1 => uint )
+        \\m = { g, h }
+    );
+    try expectContains(out.types_h, "uint32_t k0;");
+    try expectContains(out.types_h, "struct zcbor_string k1;");
+}
+
+test "a group reference chain of empty groups expands in linear time" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Each level references the previous one twice: 2^60 expansions
+    // without memoization, and none of them appends an entry, so the
+    // entry cap alone never fires.
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(arena.allocator(), "g0 = ( )\n");
+    for (1..60) |i| {
+        try appendFmt(&src, arena.allocator(), "g{d} = ( g{d}, g{d} )\n", .{ i, i - 1, i - 1 });
+    }
+    try src.appendSlice(arena.allocator(), "m = { 0 => uint, g59 }\n");
+    const out = try generateXcodeTest(arena.allocator(), src.items);
+    try expectContains(out.types_h, "struct m {");
+}
+
+test "a diamond of non-empty groups hits the expansion cap" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(arena.allocator(), "g0 = ( 0 => uint )\n");
+    for (1..40) |i| {
+        try appendFmt(&src, arena.allocator(), "g{d} = ( g{d}, g{d} )\n", .{ i, i - 1, i - 1 });
+    }
+    try src.appendSlice(arena.allocator(), "m = { g39 }\n");
+    // Fails either as "too large" or as a duplicate key, but must fail fast.
+    var pdiag: Parser.Diagnostic = .{};
+    const doc = try Parser.parse(arena.allocator(), src.items, &pdiag);
+    var gdiag: Diagnostic = .{};
+    try testing.expectError(error.Unsupported, generateDiag(arena.allocator(), doc, .{}, &gdiag));
+}
+
+test "a group rule used as a member value type is rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try expectGenError(arena.allocator(),
+        \\g = ( 0 => uint )
+        \\m = { 5 => g }
+    , error.Unsupported, "group rule cannot be used as a type");
+    try expectGenError(arena.allocator(),
+        \\g = ( 0 => uint )
+        \\m = [ * g ]
+    , error.Unsupported, "occurrence");
+}
+
+test "a group rule cannot be an --entry rule" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pdiag: Parser.Diagnostic = .{};
+    const doc = try Parser.parse(arena.allocator(),
+        \\g = ( 0 => uint )
+        \\m = { g }
+    , &pdiag);
+    var gdiag: Diagnostic = .{};
+    try testing.expectError(error.Unsupported, generateAll(arena.allocator(), doc, .{
+        .guard = "TEST_H__",
+        .entry_rules = &.{"g"},
+        .xcode = .{ .decode = true, .encode = true },
+    }, &gdiag));
+    try expectContains(gdiag.message, "group rule cannot be used as a type or entry");
+    // ... but referencing it through an entry rule is fine and generates no 'g'.
+    gdiag = .{};
+    const out = try generateAll(arena.allocator(), doc, .{
+        .guard = "TEST_H__",
+        .entry_rules = &.{"m"},
+        .xcode = .{ .decode = true, .encode = true },
+    }, &gdiag);
+    try expectContains(out.types_h, "struct m {");
+    try expectNotContains(out.types_h, "struct g");
+}
+
+test "unused group rules, including multi-choice ones, generate nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try generateXcodeTest(arena.allocator(),
+        \\g = ( 0 => uint // 1 => tstr )
+        \\k = ( 2 => uint )
+        \\m = { 9 => uint }
+    );
+    try expectNotContains(out.types_h, "struct g");
+    try expectNotContains(out.types_h, "struct k");
+    try expectContains(out.types_h, "struct m {");
+}
+
+test "a parenthesised group reference is an optional-capable inline group" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Types-only: optional inline groups have no decode/encode support.
+    var pdiag: Parser.Diagnostic = .{};
+    const doc = try Parser.parse(arena.allocator(),
+        \\g = ( 0 => uint )
+        \\m = { 1 => uint, ? (g) }
+    , &pdiag);
+    var gdiag: Diagnostic = .{};
+    const out = try generateDiag(arena.allocator(), doc, .{}, &gdiag);
+    try expectContains(out, "struct m {");
+    try expectContains(out, "_present;");
+}
+
+test "spliced group with extension point and array context decodes in order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = try generateXcodeTest(arena.allocator(),
+        \\head = ( 0 => uint )
+        \\tail = ( ? 9 => tstr, * any => any )
+        \\m = { head, tail }
+    );
+    const b = try generateXcodeTest(arena.allocator(),
+        \\head = ( 0 => uint )
+        \\tail = ( ? 9 => tstr, * any => any )
+        \\m = { 0 => uint, ? 9 => tstr, * any => any }
+    );
+    try testing.expectEqualStrings(b.types_h, a.types_h);
+    try testing.expectEqualStrings(b.decode_c.?, a.decode_c.?);
+    try testing.expectEqualStrings(b.encode_c.?, a.encode_c.?);
 }
 
 test "recursive types are rejected" {

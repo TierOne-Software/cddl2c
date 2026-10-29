@@ -206,6 +206,32 @@ library. Naming follows zcbor's conventions (`_c` enum members, `_choice`,
 | `* any => any` in a map | extension point: decode skips unknown keys (forward compatibility); no storage, nothing encoded |
 | `#6.n(T)` | represented as `T` (tag validated at xcode time) |
 
+### Group composition
+
+A group rule (`name = ( ... )`) is a template, not a type. Put its name
+as a bare member inside a map or array body and its entries are copied in
+place before anything is generated:
+
+```cddl
+counters    = ( 0 => uint, 1 => uint )
+counter-msg = { counters }           ; same code as { 0 => uint, 1 => uint }
+```
+
+* Nested references and forward references work.
+* The group rule itself produces no struct and no encode/decode functions.
+* Errors (exit code 1, printed as `FILE: error: MESSAGE: RULE-OR-KEY`; parse
+  errors are `FILE:LINE:COL: error: MESSAGE`):
+  * `occurrences on group references are not supported` (`? g`, `* g`, `1*2 g`)
+  * `multi-choice group references are not supported` (`g = ( a // b )`)
+  * `recursive group reference` (a group that refers to itself, directly or not)
+  * `duplicate member key after group reference expansion` (two spliced
+    entries use the same key; bareword `name:` and `"name" =>` are the same key)
+  * `group rule cannot be used as a type or entry` (`m = { 5 => g }`, or
+    `--entry g`)
+  * `group reference expansion too large` (more than 100000 spliced entries)
+* `? (g)` is a normal optional inline group, not a group reference. It has
+  no decode/encode support.
+
 Recursive types are rejected (cannot be statically allocated). Generics,
 `.bits`, sockets/plugs (`$`/`$$` extension points) are parsed structurally at
 best but not given semantics. Type choices inside `&()` beyond literals are
@@ -469,7 +495,7 @@ same flows against the raw zcbor API.
 
 Codec-specific limitations: `~` (unwrap), `#6` without a tag number, and
 non-literal member keys (`tstr => x`) are rejected when `-d`/`-e` is given;
-group rules referenced from map context need inlining. Group-choice maps
+group rules are handled by splicing (see below). Group-choice maps
 (`{ a // b }`) and the fragmented begin functions decode in strict CDDL
 order even in unordered mode (union backtracking and partial payloads
 don't compose with key searching).

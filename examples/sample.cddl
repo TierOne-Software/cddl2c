@@ -95,3 +95,10 @@ metric-list = [ 1*32 metric ]
 counters = ( 0 => uint, 1 => uint )
 counter-msg = { counters }
 counter-pair = [ counters ]
+
+; Nested group references, an optional member and an open-map extension
+; point all splice too: 'rich-msg' is { 0 => uint, 1 => uint, ? 2 => tstr,
+; * any => any }.
+rich-tail = ( ? 2 => tstr, * any => any )
+rich-head = ( counters, rich-tail )
+rich-msg = { rich-head }
